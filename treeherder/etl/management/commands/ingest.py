@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor 
 
 import aiohttp
 import requests
@@ -28,7 +29,6 @@ stateToExchange = {}
 for key, value in EXCHANGE_EVENT_MAP.items():
     stateToExchange[value] = key
 
-
 async def handleTaskId(taskId, root_url):
     asyncQueue = taskcluster.aio.Queue({"rootUrl": root_url}, session=session)
     results = await asyncio.gather(asyncQueue.status(taskId), asyncQueue.task(taskId))
@@ -37,10 +37,16 @@ async def handleTaskId(taskId, root_url):
         "task": results[1],
     }, root_url)
 
+async def _preload_to_DB(executor, *args):
+    return await loop.run_in_executor(
+        executor, JobLoader().process_job, *args)
 
 async def handleTask(task, root_url):
+    print("handleTask |  root_url: ", root_url, "\n")
     taskId = task["status"]["taskId"]
     runs = task["status"]["runs"]
+    executor = ThreadPoolExecutor(max_workers=4)
+    
     # If we iterate in order of the runs, we will not be able to mark older runs as
     # "retry" instead of exception
     for run in reversed(runs):
@@ -57,14 +63,20 @@ async def handleTask(task, root_url):
         }
         try:
             taskRuns = await handleMessage(message, task["task"])
-            if taskRuns:
-                for run in taskRuns:
-                    logger.info("Loading into DB:\t%s/%s", taskId, run["retryId"])
-                    # XXX: This seems our current bottleneck
-                    JobLoader().process_job(run, root_url)
         except Exception as e:
             logger.exception(e)
 
+        if taskRuns:
+            futures = [_preload_to_DB(executor, run, root_url) for run in taskRuns]
+            retryIds = [run["retryId"] for run in taskRuns]
+            for retryId, f in zip(retryIds, asyncio.as_completed(futures)):
+                logger.info("Loading into DB:\t%s/%s", taskId, retryId)
+                try:
+                    # TODO: Clean this up
+                    r = await f
+                    print(r)
+                except Exception as e:
+                    logger.exception(e)
 
 async def fetchGroupTasks(taskGroupId, root_url):
     tasks = []
